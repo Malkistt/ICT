@@ -5,7 +5,13 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.schemas.zakat_schema import MustahikInput
-from app.ml.classifier import prepare_data, train_baseline_model, NUMERIC_FEATURES, CATEGORICAL_FEATURES, TARGET_COL
+from app.ml.classifier import (
+    prepare_data,
+    train_baseline_model,
+    NUMERIC_FEATURES,
+    CATEGORICAL_FEATURES,
+    TARGET_COL,
+)
 from app.ml.auditor import evaluate_fairness
 from app.ml.debiaser import train_debiased_model, predict_debiased
 
@@ -20,35 +26,61 @@ ACTIVE_MODELS = {
 
 REQUIRED_COLUMNS = set(NUMERIC_FEATURES + CATEGORICAL_FEATURES + [TARGET_COL])
 
+# Pemetaan otomatis dari nama kolom dataset Excel tim ke format standar backend
+COLUMN_ALIASES = {
+    "penghasilan_bulanan_rp": "penghasilan",
+    "wilayah": "lokasi",
+    "status_kelayakan_mustahik": "layak",
+}
+
+
 @router.post("/audit-mitigate")
 async def audit_and_mitigate(
     file: UploadFile = File(...),
     sensitive_col: str = Form("lokasi"),
+    mitigation_method: str = Form("reweighing"),
     constraint_type: str = Form("demographic_parity"),
 ):
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="File harus berformat .csv")
+    filename = file.filename.lower()
+    if not (filename.endswith(".csv") or filename.endswith(".xlsx")):
+        raise HTTPException(
+            status_code=400, detail="File harus berformat .csv atau .xlsx"
+        )
 
     content = await file.read()
     try:
-        df = pd.read_csv(io.BytesIO(content))
+        if filename.endswith(".xlsx"):
+            df = pd.read_excel(io.BytesIO(content))
+        else:
+            df = pd.read_csv(io.BytesIO(content))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Gagal membaca CSV: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Gagal membaca file: {str(e)}")
 
-    # Normalisasi nama kolom menjadi huruf kecil tanpa spasi berlebih
+    # Normalisasi nama kolom menjadi huruf kecil & terapkan alias otomatis
     df.columns = [col.strip().lower() for col in df.columns]
+    df = df.rename(columns=COLUMN_ALIASES)
 
     missing_cols = REQUIRED_COLUMNS - set(df.columns)
     if missing_cols:
         raise HTTPException(
             status_code=400,
-            detail=f"Kolom wajib tidak ditemukan pada CSV: {sorted(list(missing_cols))}",
+            detail=f"Kolom wajib tidak ditemukan pada file: {sorted(list(missing_cols))}",
         )
 
     if sensitive_col not in df.columns:
         raise HTTPException(
             status_code=400,
             detail=f"Atribut sensitif '{sensitive_col}' tidak ada di dataset.",
+        )
+
+    # Konversi label teks "Layak" / "Tidak Layak" menjadi 1 / 0 jika belum berupa angka
+    if df[TARGET_COL].dtype == object:
+        df[TARGET_COL] = (
+            df[TARGET_COL]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .map({"layak": 1, "tidak layak": 0, "1": 1, "0": 0})
         )
 
     df = df.dropna(subset=list(REQUIRED_COLUMNS))
@@ -63,7 +95,11 @@ async def audit_and_mitigate(
 
     # 3. Jalankan mitigasi bias (debiasing) & evaluasi ulang
     preprocessor, debiased_model = train_debiased_model(
-        X_train, y_train, s_train, constraint_type=constraint_type
+        X_train,
+        y_train,
+        s_train,
+        mitigation_method=mitigation_method,
+        constraint_type=constraint_type,
     )
     y_pred_after = predict_debiased(preprocessor, debiased_model, X_test)
     after_metrics = evaluate_fairness(y_test, y_pred_after, s_test)
@@ -81,7 +117,8 @@ async def audit_and_mitigate(
             "train_rows": int(len(X_train)),
             "test_rows": int(len(X_test)),
             "sensitive_attribute": sensitive_col,
-            "mitigation_method": constraint_type,
+            "mitigation_method": mitigation_method,
+            "constraint_type": constraint_type,
         },
         "before_mitigation": before_metrics,
         "after_mitigation": after_metrics,
@@ -152,5 +189,7 @@ def download_sample_dataset():
     stream = io.StringIO()
     df_sample.to_csv(stream, index=False)
     response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
-    response.headers["Content-Disposition"] = "attachment; filename=sample_mustahik_zakat.csv"
+    response.headers["Content-Disposition"] = (
+        "attachment; filename=sample_mustahik_zakat.csv"
+    )
     return response
